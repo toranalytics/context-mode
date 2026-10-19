@@ -160,10 +160,6 @@ let _buildAutoInjection:
   | null
   | undefined = undefined;
 
-// Pending context to inject via the 'context' hook (avoiding systemPrompt mutation
-// which breaks prefix prompt cache on DeepSeek/Anthropic/OpenAI).
-// See: https://github.com/mksglu/context-mode/issues/598
-let _pendingContext = "";
 async function getAutoInjection(
   pluginRoot: string,
 ): Promise<((events: Array<{ category: string; data: string }>) => string) | null> {
@@ -430,6 +426,7 @@ export default function piExtension(pi: any): void {
   const buildDir = dirname(fileURLToPath(import.meta.url));
   const pluginRoot = resolve(buildDir, "..", "..", "..");
   const serverBundle = resolve(pluginRoot, "server.bundle.mjs");
+  let lastNote = "";
   let mcpBridgeStarted = false;
   let mcpBridgeGeneration = 0;
   const ensureMCPBridge = (foreground: boolean): Promise<void> => {
@@ -465,6 +462,7 @@ export default function piExtension(pi: any): void {
   // ── 1. session_start — Initialize session ──────────────
 
   pi.on("session_start", (_event: any, ctx: any) => {
+    lastNote = "";
     try {
       _sessionId = deriveSessionId(ctx ?? {});
       db.ensureSession(_sessionId, projectDir);
@@ -606,7 +604,6 @@ export default function piExtension(pi: any): void {
 
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     try {
-      _pendingContext = ""; // Reset — will be filled below if events exist
       // Lazily start and await the MCP bridge only when Pi is about to
       // dispatch a real agent turn. This is the non-brittle #534/#809 guard:
       // help/version/package/config CLI paths may load the extension, but they
@@ -715,40 +712,19 @@ export default function piExtension(pi: any): void {
         db.markResumeConsumed(_sessionId);
       }
 
-      // Store extra context (routing anchor, active_memory, resume, behavioralDirective)
-      // for injection via the 'context' hook as a message, NOT as a systemPrompt
-      // modification. Mutating systemPrompt breaks prefix prompt caching on
-      // DeepSeek/Anthropic/OpenAI because the system message sits at messages[0]
-      // and any change invalidates the entire cache chain.
+      // Store the note in Pi's conversation so later requests replay the same
+      // prefix. A request-only trailing note disappears on the next prompt and
+      // invalidates Anthropic's automatic cache breakpoint at the request end.
+      // Keep systemPrompt stable and avoid storing identical consecutive notes.
       const baseLen = existingPrompt ? 1 : 0;
-      if (parts.length > baseLen) {
-        const extraParts = parts.slice(baseLen);
-        _pendingContext = extraParts.join("\n\n");
-      } else {
-        _pendingContext = "";
-      }
+      const note = parts.slice(baseLen).join("\n\n");
+      if (!note || note === lastNote) return;
+      lastNote = note;
+      return {
+        message: { customType: "context-mode", content: note, display: false },
+      };
     } catch {
-      _pendingContext = ""; // Reset — ensure no stale data escapes
       // best effort — never break agent start
-    }
-  });
-
-  // ── 4a2. context — Inject active_memory + resume + behavioralDirective as message ──
-  // Uses the 'context' hook (like hindsight does) to append context at the END of
-  // messages rather than mutating systemPrompt at the beginning. This preserves
-  // prefix prompt cache for DeepSeek, Anthropic, and OpenAI.
-  pi.on("context", (event: any) => {
-    try {
-      if (!_pendingContext) return;
-      const ctx = _pendingContext;
-      _pendingContext = "";
-      event.messages.push({
-        role: "user",
-        content: ctx,
-      });
-      return { messages: event.messages };
-    } catch {
-      // best effort — never break context assembly
     }
   });
 
